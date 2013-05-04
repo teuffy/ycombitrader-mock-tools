@@ -8,10 +8,13 @@ import Control.Concurrent
 import Control.Exception
 
 import qualified Data.ByteString as B
+import qualified Data.ByteString.Lazy as LB
 import qualified Data.ByteString.Lex.Double as B
 import qualified Data.ByteString.Lex.Integral as B
+import Data.Int (Int64)
 import qualified Data.ProtocolBuffers as P
-import Data.TypeLevel (D1, D2, D3)
+import qualified Data.Serialize.Put as P
+import Data.TypeLevel (D1, D2, D3, D4, D5, D6)
 import GHC.Generics (Generic)
 
 import Data.Csv
@@ -25,13 +28,15 @@ import Network.Socket
 
 import System.Console.CmdArgs.Implicit
 import System.IO
+import qualified System.Random as R
 import System.Log.FastLogger
 import qualified System.IO.Streams.File as S
 import qualified System.IO.Streams as S
 
+import qualified Text.Show.ByteString as SB
 
 type Price = Double
-type Volume = Int
+type Volume = Int64
 
 data TickRecord = TickRecord 
     { _date    :: B.ByteString
@@ -62,12 +67,17 @@ instance FromRecord TickRecord where
         | otherwise = mzero
 
 
-data Foo = Foo
-   { field1 :: P.Required D1 (P.Value Bool) -- ^ The last field with tag = 1
+data TickProtobuf = TickProtobuf
+   { pDate :: P.Required D1 (P.Value B.ByteString)
+   , pTime :: P.Required D2 (P.Value B.ByteString)
+   , pPrice :: P.Required D3 (P.Value Double)
+   , pBid :: P.Required D4 (P.Value Double)
+   , pAsk :: P.Required D5 (P.Value Double)
+   , pVolume :: P.Required D6 (P.Value Int64)
    } deriving (Generic, Show)
 
-instance P.Encode Foo
-instance P.Decode Foo
+instance P.Encode TickProtobuf
+instance P.Decode TickProtobuf
 
 
 decodeWith :: FromRecord b => DecodeOptions -> Bool -> S.InputStream B.ByteString -> IO (S.InputStream b)
@@ -97,23 +107,62 @@ decodeWith !opts skipHeader iis = S.fromGenerator (go V.empty iis start)
                                            go buf' is k
 
 
-processRequest :: Socket -> SockAddr -> FilePath -> IO ()
-processRequest connsock clientaddr tick_filepath= do 
+connectDelay :: Int -> S.InputStream a -> S.OutputStream a -> IO ()
+connectDelay delay p q = loop
+    where
+        loop = do
+            m <- S.read p
+            threadDelay delay
+            maybe (S.write Nothing q) (const $ S.write m q >> loop) m
+{-# INLINE connectDelay #-}
+
+
+transformToPureText :: Record -> IO (B.ByteString)
+transformToPureText ss = do
+    case runParser $ parseRecord $ ss of
+        Left err -> return ""
+        Right t -> do let bs = B.intercalate "," [ _date t
+                                                  , _time t
+                                                  , B.concat . LB.toChunks . SB.show $ _price t
+                                                  , B.concat . LB.toChunks . SB.show $ _bid t
+                                                  , B.concat . LB.toChunks . SB.show $ _ask t
+                                                  , B.concat . LB.toChunks . SB.show $ _volume t
+                                                  ]
+                      return $ B.append bs "\n"
+
+
+transformToProtobuf :: Record -> IO (B.ByteString)
+transformToProtobuf ss = do
+    case runParser $ parseRecord $ ss of 
+        Left err -> return ""
+        Right t -> do let tpb = TickProtobuf { pDate = P.putField $ _date t
+                                             , pTime = P.putField $ _time t
+                                             , pPrice = P.putField $ _price t
+                                             , pBid = P.putField $ _bid t
+                                             , pAsk = P.putField $ _ask t
+                                             , pVolume = P.putField $ _volume t
+                                             }
+                      return $ P.runPut $ P.encodeMessage tpb
+
+
+processRequest :: Socket -> SockAddr -> FilePath -> String -> IO ()
+processRequest connsock clientaddr tick_filepath serialize_format = do 
     (net_is, net_os) <- S.socketToStreams connsock
     S.withFileAsInput tick_filepath (\is -> do
             is' <- Main.decodeWith I.defaultDecodeOptions False is
-            show_is <- S.mapM_ (\ss -> do
-                                    case runParser $ parseRecord $ ss of
-                                        Left err -> putStrLn . show $ err
-                                        Right t -> putStrLn . show $ _price t
-                                    return $ "GG"
-                                ) is'
-            S.connect is net_os
+            show_is <- (case serialize_format of 
+                            "puretext" -> S.mapM transformToPureText is'
+                            "protobuf" -> S.mapM transformToProtobuf is'
+                            _ -> S.mapM transformToPureText is'
+                       )
+            
+            delay <- R.randomRIO (10, 500) 
+            connectDelay delay show_is net_os
         )
 
 
-launchServer :: ServiceName -> FilePath -> IO ()
-launchServer server_port tick_filepath = withSocketsDo $ do
+launchServer :: ServiceName -> FilePath -> String -> IO ()
+launchServer server_port tick_filepath serialize_format = withSocketsDo $ do
     addrinfos <- getAddrInfo (Just (defaultHints {addrFlags = [AI_PASSIVE]})) Nothing (Just server_port)
     let serveraddr = head addrinfos
     sock <- socket (addrFamily serveraddr) Stream defaultProtocol
@@ -122,7 +171,7 @@ launchServer server_port tick_filepath = withSocketsDo $ do
 
     forever $ do
         (connsock, clientaddr) <- accept sock
-        forkFinally (processRequest connsock clientaddr tick_filepath) (\_ -> return ())
+        forkFinally (processRequest connsock clientaddr tick_filepath serialize_format) (\_ -> return ())
 
 
 forkFinally :: IO a -> (Either SomeException a -> IO ()) -> IO ThreadId
@@ -136,6 +185,7 @@ data Opts = Opts
     , sourceFiles :: [FilePath]
     , logFile :: FilePath
     , port :: String
+    , serializeFormat :: String
     } deriving (Data, Typeable, Show, Eq)
 
 
@@ -143,6 +193,7 @@ progOpts :: Opts
 progOpts = Opts
     { sourceFiles = def &= args &= typ "source files"
     , port = def &= help "server port"
+    , serializeFormat = def &= help "serialize format"
     , debug = def &= help "debug mode"
     , logFile = def &= help "log filepath"
     }
@@ -155,6 +206,7 @@ getOpts = cmdArgs $ progOpts
     &= help _PROGRAM_DESC
     &= helpArg [explicit, name "help", name "h"]
     &= versionArg [explicit, name "version", name "v", summary _PROGRAM_INFO]
+
 
 _PROGRAM_NAME :: String
 _PROGRAM_NAME = "ycombitrader-mock-server"
@@ -180,8 +232,10 @@ main = do
         then do 
             let filename = head . sourceFiles $ opts
                 server_port = port $ opts
+                serialize_format = serializeFormat $ opts
             logger <- mkLogger True stdout
             loggerPutStr logger $ map toLogStr ["reading file ", filename, "\n"]
-            launchServer server_port filename
+            loggerPutStr logger $ map toLogStr ["serialize format: ", serialize_format, "\n"]
+            launchServer server_port filename serialize_format
             return ()
         else do putStrLn $ "No input file given."
